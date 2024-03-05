@@ -39,6 +39,9 @@ import copy
 import scipy
 import random
 
+from accelerate import Accelerator
+from dlx import write_to_file
+
 
 def sas_collate_fn(batch):
     X = []
@@ -60,6 +63,7 @@ def sas_collate_fn(batch):
 class TabModel(BaseEstimator):
     """ Class for TabNet model."""
 
+    accelerator: Accelerator = None
     n_d: int = 8
     n_a: int = 8
     n_steps: int = 3
@@ -255,6 +259,7 @@ class TabModel(BaseEstimator):
             drop_last=drop_last,
             pin_memory=pin_memory,
             collate_fn=sas_collate_fn,
+            persistent_workers=False if num_workers==0 else True,
         )
         if from_unsupervised is not None:
             # Update parameters to match self pretraining
@@ -273,6 +278,10 @@ class TabModel(BaseEstimator):
             warnings.warn("Loading weights from unsupervised pretraining")
         # Call method on_train_begin for all callbacks
         self._callback_container.on_train_begin()
+        
+        ################## DDP ##################
+        self.network, self._optimizer, train_dataloader = self.accelerator.prepare(self.network, self._optimizer, train_dataloader)
+        ################## DDP ##################
 
         # Training loop over epochs
         for epoch_idx in range(self.max_epochs):
@@ -300,9 +309,11 @@ class TabModel(BaseEstimator):
         self.network.eval()
 
         # TODO: simplify the problem...
-        # if self.compute_importance:
-        #     # compute feature importance once the best model is defined
-        #     self.feature_importances_ = self._compute_feature_importances(X_train)
+        if self.compute_importance:
+            # compute feature importance once the best model is defined
+            self.feature_importances_ = self._compute_feature_importances(train_dataloader)
+            feature_importances_tensor = torch.tensor(self.feature_importances_, device=self.accelerator.device)
+            self.feature_importances_ = self.accelerator.reduce(feature_importances_tensor, reduction="mean").cpu().numpy()
 
     def fit(
         self,
@@ -518,26 +529,33 @@ class TabModel(BaseEstimator):
             Sparse matrix showing attention masks used by network.
         """
         self.network.eval()
-
-        if scipy.sparse.issparse(X):
-            dataloader = DataLoader(
-                SparsePredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
+        if isinstance(X, DataLoader):
+            dataloader = X
         else:
-            dataloader = DataLoader(
-                PredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
+            if scipy.sparse.issparse(X):
+                dataloader = DataLoader(
+                    SparsePredictDataset(X),
+                    batch_size=self.batch_size,
+                    shuffle=False,
+                )
+            else:
+                dataloader = DataLoader(
+                    PredictDataset(X),
+                    batch_size=self.batch_size,
+                    shuffle=False,
+                )
 
         res_explain = []
 
         for batch_nb, data in enumerate(dataloader):
+            if isinstance(data, list):
+                data = data[0]
             data = data.to(self.device).float()
+            if self.accelerator:
+                M_explain, masks = self.accelerator.unwrap_model(self.network).forward_masks(data)
+            else:
+                M_explain, masks = self.network.forward_masks(data)
 
-            M_explain, masks = self.network.forward_masks(data)
             for key, value in masks.items():
                 masks[key] = csc_matrix.dot(
                     value.cpu().detach().numpy(), self.reducing_matrix
@@ -715,7 +733,10 @@ class TabModel(BaseEstimator):
         loss = loss - self.lambda_sparse * M_loss
 
         # Perform backward pass and optimization
-        loss.backward()
+        if self.accelerator:
+            self.accelerator.backward(loss)
+        else:
+            loss.backward()
         if self.clip_value:
             clip_grad_norm_(self.network.parameters(), self.clip_value)
         self._optimizer.step()
