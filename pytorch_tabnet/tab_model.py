@@ -4,7 +4,8 @@ from scipy.special import softmax
 from pytorch_tabnet.utils import SparsePredictDataset, PredictDataset, filter_weights
 from pytorch_tabnet.abstract_model import TabModel
 from pytorch_tabnet.multiclass_utils import infer_output_dim, check_output_dim
-from torch.utils.data import DataLoader
+from pytorch_tabnet.utils import sas_collate_fn
+from torch.utils.data import DataLoader, Dataset
 import scipy
 
 
@@ -51,8 +52,8 @@ class TabNetClassifier(TabModel):
         weights,
     ):
         output_dim, train_labels = infer_output_dim(y_train)
-        for X, y in eval_set:
-            check_output_dim(train_labels, y)
+        # for X, y in eval_set:
+        #     check_output_dim(train_labels, y)
         self.output_dim = output_dim
         self._default_metric = ('auc' if self.output_dim == 2 else 'accuracy')
         self.classes_ = train_labels
@@ -92,25 +93,34 @@ class TabNetClassifier(TabModel):
 
         if scipy.sparse.issparse(X):
             dataloader = DataLoader(
-                SparsePredictDataset(X),
+                SparsePredictDataset(X) if not isinstance(X, Dataset) else X,
                 batch_size=self.batch_size,
                 shuffle=False,
+                collate_fn=sas_collate_fn,
             )
         else:
             dataloader = DataLoader(
-                PredictDataset(X),
+                PredictDataset(X) if not isinstance(X, Dataset) else X,
                 batch_size=self.batch_size,
                 shuffle=False,
+                collate_fn=sas_collate_fn,
             )
 
         results = []
+        labels = []
         for batch_nb, data in enumerate(dataloader):
+            if isinstance(data, tuple):
+                labels.append(data[1].numpy())
+                data = data[0]
             data = data.to(self.device).float()
 
             output, M_loss = self.network(data)
             predictions = torch.nn.Softmax(dim=1)(output).cpu().detach().numpy()
             results.append(predictions)
         res = np.vstack(results)
+        if len(labels):
+            labels = np.concatenate(labels)
+            return res, labels
         return res
 
 

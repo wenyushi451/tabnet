@@ -17,7 +17,8 @@ from pytorch_tabnet.utils import (
     check_input,
     check_warm_start,
     create_group_matrix,
-    check_embedding_parameters
+    check_embedding_parameters,
+    sas_collate_fn
 )
 from pytorch_tabnet.callbacks import (
     CallbackContainer,
@@ -40,23 +41,6 @@ import scipy
 import random
 
 from accelerate import Accelerator
-from dlx import write_to_file
-
-
-def sas_collate_fn(batch):
-    X = []
-    y = []
-    
-    for record in batch:
-        x, y_ = record[:-1], record[-1]  # this should work with expected dataset
-        # x, y_ = record[:-1], random.randint(0, 1)  # TODO: I fake y here because I don't have a data set with integer value.
-        X.append(torch.tensor(x))
-        y.append(y_)
-    
-    X = torch.stack(X)
-    y = torch.tensor(y)
-    
-    return X, y
 
 
 @dataclass
@@ -245,13 +229,7 @@ class TabModel(BaseEstimator):
         # Validate and reformat eval set depending on training data
         # eval_names, eval_set = validate_eval_set(eval_set, eval_name, X_train, y_train)
         self.early_stopping_metric = None
-        eval_names = []
-        """
-        # TODO: simplify the problem...
-        train_dataloader, valid_dataloaders = self._construct_loaders(
-            X_train, y_train, eval_set
-        )
-        """
+        eval_names = [eval_name]
         train_dataloader = DataLoader(
             train_data,
             batch_size=batch_size,
@@ -261,6 +239,20 @@ class TabModel(BaseEstimator):
             collate_fn=sas_collate_fn,
             persistent_workers=False if num_workers==0 else True,
         )
+        
+        valid_dataloaders = []
+        if eval_set:
+            valid_dataloaders = DataLoader(
+                eval_set,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                drop_last=drop_last,
+                pin_memory=pin_memory,
+                collate_fn=sas_collate_fn,
+                persistent_workers=False if num_workers==0 else True,
+            )
+            valid_dataloaders = [valid_dataloaders]
+        
         if from_unsupervised is not None:
             # Update parameters to match self pretraining
             self.__update__(**from_unsupervised.get_params())
@@ -292,10 +284,8 @@ class TabModel(BaseEstimator):
             self._train_epoch(train_dataloader)
 
             # Apply predict epoch to all eval sets
-            """
             for eval_name, valid_dataloader in zip(eval_names, valid_dataloaders):
                 self._predict_epoch(eval_name, valid_dataloader)
-            """
             # Call method on_epoch_end for all callbacks
             self._callback_container.on_epoch_end(
                 epoch_idx, logs=self.history.epoch_metrics

@@ -9,6 +9,22 @@ import pandas as pd
 import warnings
 
 
+def sas_collate_fn(batch):
+    X = []
+    y = []
+    
+    for record in batch:
+        x, y_ = record[:-1], record[-1]  # this should work with expected dataset
+        # x, y_ = record[:-1], random.randint(0, 1)  # TODO: I fake y here because I don't have a data set with integer value.
+        X.append(torch.tensor(x))
+        y.append(y_)
+    
+    X = torch.stack(X)
+    y = torch.tensor(y)
+    
+    return X, y
+
+
 class TorchDataset(Dataset):
     """
     Format for numpy array
